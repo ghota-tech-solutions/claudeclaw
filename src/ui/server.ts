@@ -5,6 +5,7 @@ import { buildState, buildTechnicalInfo, sanitizeSettings } from "./services/sta
 import { readHeartbeatSettings, updateHeartbeatSettings } from "./services/settings";
 import { createQuickJob, deleteJob } from "./services/jobs";
 import { readLogs } from "./services/logs";
+import { spawnAgent, getActiveAgents, getAgent, getAgentOutput, killAgent } from "../agent-pool";
 
 export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
   const server = Bun.serve({
@@ -146,6 +147,50 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       if (url.pathname === "/api/logs") {
         const tail = clampInt(url.searchParams.get("tail"), 200, 20, 2000);
         return json(await readLogs(tail));
+      }
+
+      // --- Agent Pool endpoints ---
+
+      // POST /api/agents/spawn — spawn a new parallel agent
+      if (url.pathname === "/api/agents/spawn" && req.method === "POST") {
+        try {
+          const body = await req.json() as { task?: string; building?: string };
+          const task = body.task?.trim();
+          if (!task) return json({ ok: false, error: "Missing task" });
+          const agent = await spawnAgent(task, body.building);
+          return json({ ok: true, agent });
+        } catch (err) {
+          return json({ ok: false, error: String(err) });
+        }
+      }
+
+      // GET /api/agents — list all agents
+      if (url.pathname === "/api/agents" && req.method === "GET") {
+        return json({ agents: getActiveAgents() });
+      }
+
+      // GET /api/agents/:id — get a specific agent
+      if (url.pathname.startsWith("/api/agents/") && req.method === "GET") {
+        const id = decodeURIComponent(url.pathname.slice("/api/agents/".length));
+
+        // /api/agents/:id/output — get agent output
+        if (id.includes("/output")) {
+          const agentId = id.replace("/output", "");
+          const tail = clampInt(url.searchParams.get("tail"), 100, 10, 500);
+          const output = getAgentOutput(agentId, tail);
+          return json({ output });
+        }
+
+        const agent = getAgent(id);
+        if (!agent) return json({ ok: false, error: "Agent not found" });
+        return json({ agent });
+      }
+
+      // DELETE /api/agents/:id — kill a running agent
+      if (url.pathname.startsWith("/api/agents/") && req.method === "DELETE") {
+        const id = decodeURIComponent(url.pathname.slice("/api/agents/".length));
+        const killed = killAgent(id);
+        return json({ ok: killed, error: killed ? undefined : "Agent not found or already finished" });
       }
 
       return new Response("Not found", { status: 404 });
