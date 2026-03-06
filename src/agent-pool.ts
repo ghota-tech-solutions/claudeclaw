@@ -1,8 +1,9 @@
 /**
- * Agent Pool — manages parallel Claude processes.
+ * Agent Pool v2 — Persistent parallel Claude agents.
  *
- * Each agent is an independent `claude -p` process with its own session.
- * Agents run in parallel (no serial queue) and stream output in real-time.
+ * Agents survive across tasks. After completing a task, they go "idle"
+ * and can be resumed with a new task via `--resume <sessionId>`.
+ * Stop an agent explicitly when you're done with it.
  */
 
 import { mkdir } from "fs/promises";
@@ -21,20 +22,21 @@ export interface AgentInfo {
   id: string;
   name: string;
   task: string;
-  status: "running" | "done" | "error";
+  status: "running" | "idle" | "done" | "error" | "stopped";
   pid: number | null;
+  sessionId: string | null;
   startedAt: string;
   finishedAt: string | null;
   exitCode: number | null;
   output: string[];
   building: string;
+  taskHistory: string[];
 }
 
 const agents = new Map<string, AgentInfo & { proc: ReturnType<typeof Bun.spawn> | null }>();
 let agentCounter = 0;
 
 const AGENT_NAMES = ["Pixel", "Spark", "Echo", "Drift", "Neon", "Pulse", "Volt", "Flux", "Byte", "Zinc"];
-const AGENT_COLORS = ["#ff7043", "#66bb6a", "#ab47bc", "#ffa726", "#26c6da", "#ef5350", "#9ccc65", "#7e57c2", "#ffca28", "#78909c"];
 
 // Event listeners for state changes
 type AgentEventListener = (agent: AgentInfo) => void;
@@ -98,25 +100,7 @@ const DIR_SCOPE_PROMPT = [
   "If a request requires accessing files outside the project, refuse and explain why.",
 ].join("\n");
 
-/**
- * Spawn a new parallel agent. Does NOT use the global session —
- * each agent gets its own fresh session via `--output-format json`.
- */
-export async function spawnAgent(task: string, building?: string): Promise<AgentInfo> {
-  if (agents.size >= MAX_AGENTS) {
-    throw new Error(`Max ${MAX_AGENTS} parallel agents reached`);
-  }
-
-  await mkdir(LOGS_DIR, { recursive: true });
-
-  const idx = agentCounter++;
-  const id = `agent-${Date.now()}-${idx}`;
-  const name = AGENT_NAMES[idx % AGENT_NAMES.length];
-
-  const { security, model, api } = getSettings();
-  const securityArgs = buildSecurityArgs(security);
-
-  // Build system prompt
+async function buildAppendPrompt(name: string, task: string): Promise<string> {
   const promptContent = await loadPrompts();
   const appendParts: string[] = [
     `You are agent "${name}" running inside ClaudeClaw (parallel agent pool).`,
@@ -132,66 +116,35 @@ export async function spawnAgent(task: string, building?: string): Promise<Agent
     } catch {}
   }
 
+  const { security } = getSettings();
   if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
 
-  // Build clock prefix
-  let clockPrefix = "";
+  return appendParts.join("\n\n");
+}
+
+function buildClockPrefix(): string {
   try {
     const settings = getSettings();
-    clockPrefix = buildClockPromptPrefix(new Date(), settings.timezoneOffsetMinutes);
-  } catch {}
-
-  const fullPrompt = clockPrefix ? `${clockPrefix}\n${task}` : task;
-
-  // Build args — new session (json output to capture session_id)
-  const args = ["claude", "-p", fullPrompt, "--output-format", "text", ...securityArgs];
-
-  if (model.trim() && model.trim().toLowerCase() !== "glm") {
-    args.push("--model", model.trim());
+    return buildClockPromptPrefix(new Date(), settings.timezoneOffsetMinutes);
+  } catch {
+    return "";
   }
+}
 
-  if (appendParts.length > 0) {
-    args.push("--append-system-prompt", appendParts.join("\n\n"));
-  }
-
-  // Clean env
+function getCleanEnv(): Record<string, string> {
   const { CLAUDECODE: _, ...cleanEnv } = process.env;
   const childEnv: Record<string, string> = { ...cleanEnv } as Record<string, string>;
+  const { api, model } = getSettings();
   if (api.trim()) childEnv.ANTHROPIC_AUTH_TOKEN = api.trim();
   if (model.trim().toLowerCase() === "glm") {
     childEnv.ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic";
     childEnv.API_TIMEOUT_MS = "3000000";
   }
+  return childEnv;
+}
 
-  const agent: AgentInfo & { proc: ReturnType<typeof Bun.spawn> | null } = {
-    id,
-    name,
-    task,
-    status: "running",
-    pid: null,
-    startedAt: new Date().toISOString(),
-    finishedAt: null,
-    exitCode: null,
-    output: [],
-    building: building || "claudeclaw",
-    proc: null,
-  };
-
-  // Spawn process
-  const proc = Bun.spawn(args, {
-    stdout: "pipe",
-    stderr: "pipe",
-    env: childEnv,
-  });
-
-  agent.proc = proc;
-  agent.pid = proc.pid;
-  agents.set(id, agent);
-
-  console.log(`[${new Date().toLocaleTimeString()}] Agent "${name}" (${id}) spawned for: ${task.slice(0, 80)}`);
-  notifyListeners(toInfo(agent));
-
-  // Stream stdout in background
+function streamOutput(proc: ReturnType<typeof Bun.spawn>, agent: AgentInfo & { proc: any }) {
+  // Stream stdout
   (async () => {
     const reader = proc.stdout.getReader();
     const decoder = new TextDecoder();
@@ -200,11 +153,9 @@ export async function spawnAgent(task: string, building?: string): Promise<Agent
         const { done, value } = await reader.read();
         if (done) break;
         const text = decoder.decode(value, { stream: true });
-        const lines = text.split("\n");
-        for (const line of lines) {
+        for (const line of text.split("\n")) {
           if (line.trim()) {
             agent.output.push(line);
-            // Keep output buffer reasonable
             if (agent.output.length > 500) {
               agent.output.splice(0, agent.output.length - 400);
             }
@@ -214,7 +165,123 @@ export async function spawnAgent(task: string, building?: string): Promise<Agent
     } catch {}
   })();
 
-  // Stream stderr in background
+  // Stream stderr
+  (async () => {
+    const reader = proc.stderr.getReader();
+    const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const text = decoder.decode(value, { stream: true });
+        if (text.trim()) {
+          agent.output.push(`[stderr] ${text.trim()}`);
+        }
+      }
+    } catch {}
+  })();
+}
+
+/**
+ * Spawn a new persistent agent with an initial task.
+ */
+export async function spawnAgent(task: string, building?: string): Promise<AgentInfo> {
+  const runningCount = Array.from(agents.values()).filter(a => a.status === "running").length;
+  if (runningCount >= MAX_AGENTS) {
+    throw new Error(`Max ${MAX_AGENTS} running agents reached`);
+  }
+
+  await mkdir(LOGS_DIR, { recursive: true });
+
+  const idx = agentCounter++;
+  const id = `agent-${Date.now()}-${idx}`;
+  const name = AGENT_NAMES[idx % AGENT_NAMES.length];
+
+  const { security, model } = getSettings();
+  const securityArgs = buildSecurityArgs(security);
+  const appendPrompt = await buildAppendPrompt(name, task);
+  const clockPrefix = buildClockPrefix();
+  const fullPrompt = clockPrefix ? `${clockPrefix}\n${task}` : task;
+
+  // Use --output-format json to capture session_id from the response
+  const args = ["claude", "-p", fullPrompt, "--output-format", "json", ...securityArgs];
+
+  if (model.trim() && model.trim().toLowerCase() !== "glm") {
+    args.push("--model", model.trim());
+  }
+  if (appendPrompt) {
+    args.push("--append-system-prompt", appendPrompt);
+  }
+
+  const agent: AgentInfo & { proc: ReturnType<typeof Bun.spawn> | null } = {
+    id,
+    name,
+    task,
+    status: "running",
+    pid: null,
+    sessionId: null,
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    exitCode: null,
+    output: [],
+    building: building || "claudeclaw",
+    taskHistory: [task],
+    proc: null,
+  };
+
+  const proc = Bun.spawn(args, {
+    stdout: "pipe",
+    stderr: "pipe",
+    env: getCleanEnv(),
+  });
+
+  agent.proc = proc;
+  agent.pid = proc.pid;
+  agents.set(id, agent);
+
+  console.log(`[${new Date().toLocaleTimeString()}] Agent "${name}" (${id}) spawned for: ${task.slice(0, 80)}`);
+  notifyListeners(toInfo(agent));
+
+  // Capture full stdout to extract session_id from JSON
+  const stdoutChunks: string[] = [];
+  (async () => {
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const text = decoder.decode(value, { stream: true });
+        stdoutChunks.push(text);
+        // Also push readable lines to output
+        for (const line of text.split("\n")) {
+          if (line.trim()) {
+            // Try to parse JSON to extract result text
+            try {
+              const json = JSON.parse(line);
+              if (json.result) {
+                // Push the actual result text, not raw JSON
+                for (const rl of json.result.split("\n")) {
+                  if (rl.trim()) agent.output.push(rl);
+                }
+              }
+              if (json.session_id) {
+                agent.sessionId = json.session_id;
+              }
+            } catch {
+              // Not JSON, push as-is
+              agent.output.push(line);
+            }
+            if (agent.output.length > 500) {
+              agent.output.splice(0, agent.output.length - 400);
+            }
+          }
+        }
+      }
+    } catch {}
+  })();
+
+  // Stream stderr
   (async () => {
     const reader = proc.stderr.getReader();
     const decoder = new TextDecoder();
@@ -230,18 +297,47 @@ export async function spawnAgent(task: string, building?: string): Promise<Agent
     } catch {}
   })();
 
-  // Wait for process to finish
+  // When process finishes — agent goes IDLE, not done
   proc.exited.then(async (exitCode) => {
-    agent.status = exitCode === 0 ? "done" : "error";
-    agent.exitCode = exitCode;
-    agent.finishedAt = new Date().toISOString();
+    // Try to extract session_id from JSON output
+    const fullOutput = stdoutChunks.join("");
+    try {
+      const json = JSON.parse(fullOutput);
+      if (json.session_id) {
+        agent.sessionId = json.session_id;
+      }
+    } catch {
+      // May have been streamed in chunks, try line by line
+      for (const line of fullOutput.split("\n")) {
+        try {
+          const json = JSON.parse(line);
+          if (json.session_id) agent.sessionId = json.session_id;
+        } catch {}
+      }
+    }
 
-    // Write log file
+    if (exitCode === 0 && agent.status === "running") {
+      // Task done — agent goes idle, ready for next task
+      agent.status = "idle";
+      agent.exitCode = exitCode;
+      agent.finishedAt = new Date().toISOString();
+      agent.proc = null;
+      console.log(`[${new Date().toLocaleTimeString()}] Agent "${name}" (${id}) idle — session: ${agent.sessionId || "unknown"}`);
+    } else if (agent.status === "running") {
+      agent.status = "error";
+      agent.exitCode = exitCode;
+      agent.finishedAt = new Date().toISOString();
+      agent.proc = null;
+      console.log(`[${new Date().toLocaleTimeString()}] Agent "${name}" (${id}) error — exit code ${exitCode}`);
+    }
+
+    // Write log
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const logFile = join(LOGS_DIR, `agent-${name}-${timestamp}.log`);
     const logContent = [
       `# agent-${name}`,
-      `Date: ${agent.finishedAt}`,
+      `Date: ${new Date().toISOString()}`,
+      `Session: ${agent.sessionId || "unknown"}`,
       `Task: ${task}`,
       `Exit code: ${exitCode}`,
       "",
@@ -250,7 +346,120 @@ export async function spawnAgent(task: string, building?: string): Promise<Agent
     ].join("\n");
     await Bun.write(logFile, logContent);
 
-    console.log(`[${new Date().toLocaleTimeString()}] Agent "${name}" (${id}) finished with exit code ${exitCode}`);
+    notifyListeners(toInfo(agent));
+  });
+
+  return toInfo(agent);
+}
+
+/**
+ * Resume an idle agent with a new task.
+ * Uses `claude -p --resume <sessionId>` to continue the conversation.
+ */
+export async function resumeAgent(id: string, task: string): Promise<AgentInfo> {
+  const agent = agents.get(id);
+  if (!agent) throw new Error(`Agent ${id} not found`);
+  if (agent.status !== "idle") throw new Error(`Agent ${agent.name} is ${agent.status}, not idle`);
+  if (!agent.sessionId) throw new Error(`Agent ${agent.name} has no session ID — cannot resume`);
+
+  const { security, model } = getSettings();
+  const securityArgs = buildSecurityArgs(security);
+  const clockPrefix = buildClockPrefix();
+  const fullPrompt = clockPrefix ? `${clockPrefix}\n${task}` : task;
+
+  const args = [
+    "claude", "-p", fullPrompt,
+    "--resume", agent.sessionId,
+    "--output-format", "json",
+    ...securityArgs,
+  ];
+
+  if (model.trim() && model.trim().toLowerCase() !== "glm") {
+    args.push("--model", model.trim());
+  }
+
+  // Update agent state
+  agent.task = task;
+  agent.status = "running";
+  agent.finishedAt = null;
+  agent.exitCode = null;
+  agent.taskHistory.push(task);
+  agent.output.push(`\n── New task: ${task} ──`);
+
+  const proc = Bun.spawn(args, {
+    stdout: "pipe",
+    stderr: "pipe",
+    env: getCleanEnv(),
+  });
+
+  agent.proc = proc;
+  agent.pid = proc.pid;
+
+  console.log(`[${new Date().toLocaleTimeString()}] Agent "${agent.name}" (${id}) resumed for: ${task.slice(0, 80)}`);
+  notifyListeners(toInfo(agent));
+
+  // Capture stdout
+  const stdoutChunks: string[] = [];
+  (async () => {
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const text = decoder.decode(value, { stream: true });
+        stdoutChunks.push(text);
+        for (const line of text.split("\n")) {
+          if (line.trim()) {
+            try {
+              const json = JSON.parse(line);
+              if (json.result) {
+                for (const rl of json.result.split("\n")) {
+                  if (rl.trim()) agent.output.push(rl);
+                }
+              }
+            } catch {
+              agent.output.push(line);
+            }
+            if (agent.output.length > 500) {
+              agent.output.splice(0, agent.output.length - 400);
+            }
+          }
+        }
+      }
+    } catch {}
+  })();
+
+  // Stream stderr
+  (async () => {
+    const reader = proc.stderr.getReader();
+    const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const text = decoder.decode(value, { stream: true });
+        if (text.trim()) {
+          agent.output.push(`[stderr] ${text.trim()}`);
+        }
+      }
+    } catch {}
+  })();
+
+  // When finished — idle again
+  proc.exited.then(async (exitCode) => {
+    if (exitCode === 0 && agent.status === "running") {
+      agent.status = "idle";
+      agent.exitCode = exitCode;
+      agent.finishedAt = new Date().toISOString();
+      agent.proc = null;
+      console.log(`[${new Date().toLocaleTimeString()}] Agent "${agent.name}" (${id}) idle again — tasks completed: ${agent.taskHistory.length}`);
+    } else if (agent.status === "running") {
+      agent.status = "error";
+      agent.exitCode = exitCode;
+      agent.finishedAt = new Date().toISOString();
+      agent.proc = null;
+    }
     notifyListeners(toInfo(agent));
   });
 
@@ -262,22 +471,29 @@ function toInfo(agent: AgentInfo & { proc: any }): AgentInfo {
   return info;
 }
 
-/** Kill a running agent */
-export function killAgent(id: string): boolean {
+/** Stop an agent — kills process if running, removes from pool */
+export function stopAgent(id: string): boolean {
   const agent = agents.get(id);
-  if (!agent || !agent.proc) return false;
+  if (!agent) return false;
 
-  try {
-    agent.proc.kill();
-    agent.status = "error";
-    agent.finishedAt = new Date().toISOString();
-    agent.exitCode = -1;
-    agent.output.push("[killed by user]");
-    notifyListeners(toInfo(agent));
-    return true;
-  } catch {
-    return false;
+  if (agent.proc) {
+    try { agent.proc.kill(); } catch {}
   }
+
+  agent.status = "stopped";
+  agent.finishedAt = new Date().toISOString();
+  agent.exitCode = -1;
+  agent.output.push("[stopped by user]");
+  agent.proc = null;
+
+  console.log(`[${new Date().toLocaleTimeString()}] Agent "${agent.name}" (${id}) stopped`);
+  notifyListeners(toInfo(agent));
+  return true;
+}
+
+/** Kill a running agent (alias for backward compat) */
+export function killAgent(id: string): boolean {
+  return stopAgent(id);
 }
 
 /** Get all agents */
@@ -298,11 +514,11 @@ export function getAgentOutput(id: string, tail = 100): string[] {
   return agent.output.slice(-tail);
 }
 
-/** Clean up finished agents older than 30 minutes */
+/** Clean up stopped/error agents older than 30 minutes */
 export function cleanupAgents() {
   const cutoff = Date.now() - 30 * 60 * 1000;
   for (const [id, agent] of agents) {
-    if (agent.status !== "running" && agent.finishedAt) {
+    if ((agent.status === "stopped" || agent.status === "error") && agent.finishedAt) {
       const finishedTime = new Date(agent.finishedAt).getTime();
       if (finishedTime < cutoff) {
         agents.delete(id);
@@ -311,5 +527,4 @@ export function cleanupAgents() {
   }
 }
 
-// Cleanup every 5 minutes
 setInterval(cleanupAgents, 5 * 60 * 1000);

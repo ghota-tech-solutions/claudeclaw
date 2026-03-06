@@ -5,7 +5,7 @@ import { buildState, buildTechnicalInfo, sanitizeSettings } from "./services/sta
 import { readHeartbeatSettings, updateHeartbeatSettings } from "./services/settings";
 import { createQuickJob, deleteJob } from "./services/jobs";
 import { readLogs } from "./services/logs";
-import { spawnAgent, getActiveAgents, getAgent, getAgentOutput, killAgent } from "../agent-pool";
+import { spawnAgent, resumeAgent, getActiveAgents, getAgent, getAgentOutput, killAgent, stopAgent } from "../agent-pool";
 
 export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
   const server = Bun.serve({
@@ -191,6 +191,20 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         const id = decodeURIComponent(url.pathname.slice("/api/agents/".length));
         const killed = killAgent(id);
         return json({ ok: killed, error: killed ? undefined : "Agent not found or already finished" });
+      }
+
+      // POST /api/agents/:id/resume — send a new task to an idle agent
+      if (url.pathname.startsWith("/api/agents/") && url.pathname.endsWith("/resume") && req.method === "POST") {
+        const id = decodeURIComponent(url.pathname.slice("/api/agents/".length).replace("/resume", ""));
+        try {
+          const body = await req.json() as { task?: string };
+          const task = body.task?.trim();
+          if (!task) return json({ ok: false, error: "Missing task" });
+          const agent = await resumeAgent(id, task);
+          return json({ ok: true, agent });
+        } catch (err) {
+          return json({ ok: false, error: String(err) });
+        }
       }
 
       return new Response("Not found", { status: 404 });
